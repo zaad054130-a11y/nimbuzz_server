@@ -1,0 +1,231 @@
+const express = require('express');
+const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+
+const app = express();
+const PORT = 5001;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// محاولة اتصال MongoDB (اختياري — السيرفر يعمل بدونه)
+try {
+  const mongoose = require('mongoose');
+  const dbURI = "mongodb://127.0.0.1:27017/nimbuzz_db";
+  mongoose.connect(dbURI)
+    .then(() => console.log("[DATABASE] CONNECTED SUCCESSFULLY!"))
+    .catch((err) => console.log("[DATABASE] OFFLINE MODE (no mongo) — chat/login-demo still works:", err.message));
+} catch (e) {
+  console.log("[DATABASE] mongoose not available, running in memory mode");
+}
+
+// Base Route
+app.get('/', (req, res) => {
+  res.send('Nimbuzz Server is Running Successfully');
+});
+
+// ربط روترات المصادقة والغرف (مع حماية من غياب DB)
+try { app.use('/api/auth', require('./routes/auth')); }
+catch (e) { console.log('[ROUTES] auth disabled:', e.message); }
+try { app.use('/api/rooms', require('./routes/roomRoutes')); }
+catch (e) { console.log('[ROUTES] rooms disabled:', e.message); }
+app.use('/api/chat', require('./routes/chat'));
+
+// 🔐 دخول البوت — فحص حقيقي 100% من Firebase (نفس مصدر حسابات النمبز الحقيقي)
+// حسابات النمبز تُنشأ في Firebase Auth + Firestore (collection: generated_accounts)
+// لذا نتحقق من الحساب بنفس الطريقة تماماً بدلاً من MongoDB.
+const FIREBASE_WEB_API_KEY = 'AIzaSyDk6ZvANIJfZVG9me426rxSsIALhcenP5A';
+const FIREBASE_PROJECT_ID = 'talkinchat-pro-server';
+
+// 🔎 تحويل اسم المستخدم (nickname) إلى بريد عبر Firestore generated_accounts
+async function findNimbuzzEmailByNickname(nickname) {
+    const norm = String(nickname || '').trim();
+    if (!norm) return null;
+    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery?key=${FIREBASE_WEB_API_KEY}`;
+    const body = {
+        structuredQuery: {
+            from: [{ collectionId: 'generated_accounts' }],
+            where: {
+                fieldFilter: {
+                    field: { fieldPath: 'nickname' },
+                    op: 'EQUAL',
+                    value: { stringValue: norm },
+                },
+            },
+            limit: 1,
+        },
+    };
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (r.status < 200 || r.status >= 300) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return null;
+    for (const row of rows) {
+        const fields = row && row.document && row.document.fields;
+        if (fields && fields.email && fields.email.stringValue) {
+            return fields.email.stringValue;
+        }
+    }
+    return null;
+}
+
+app.post('/api/bot/login', async (req, res) => {
+    try {
+        const { identity, password } = req.body || {};
+        if (!identity || !password) {
+            return res.status(400).json({ msg: 'اكتب اسم المستخدم وكلمة المرور' });
+        }
+
+        const identityStr = String(identity).trim();
+
+        // 1) تحديد البريد: إما أنه بريد مباشرة، أو اسم مستخدم نبحث عنه في Firestore
+        let email = null;
+        if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(identityStr)) {
+            email = identityStr;
+        } else {
+            email = await findNimbuzzEmailByNickname(identityStr);
+        }
+
+        // في حال كان nickname مخزّناً في Mongo (خيار احتياطي لو توفّر) — نحاول أيضاً
+        if (!email) {
+            try {
+                const mongoose = require('mongoose');
+                if (mongoose.connection && mongoose.connection.readyState === 1) {
+                    const User = mongoose.models.User || require('./models/User');
+                    const found = await User.findOne({ nickname: identityStr });
+                    if (found && found.email) email = found.email;
+                }
+            } catch (_) { /* تجاهل */ }
+        }
+
+        if (!email) {
+            return res.status(400).json({ msg: '❌ هذا الحساب غير موجود في شبكة النمبز!' });
+        }
+
+        // 2) التحقق من كلمة المرور عبر Firebase Auth (المصدر الحقيقي للحسابات)
+        const signInUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`;
+        const sr = await fetch(signInUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password, returnSecureToken: true }),
+        });
+        const sdata = await sr.json();
+
+        if (sr.status < 200 || sr.status >= 300) {
+            const code = sdata && sdata.error && sdata.error.message ? sdata.error.message : '';
+            if (code.includes('PASSWORD') || code.includes('INVALID_LOGIN') || code.includes('EMAIL_NOT_FOUND')) {
+                return res.status(400).json({ msg: '❌ كلمة المرور غير صحيحة!' });
+            }
+            return res.status(400).json({ msg: '❌ تعذر التحقق من الحساب عبر Firebase: ' + code });
+        }
+
+        // 🔒 نجح التحقق من Firebase — الحساب حقيقي
+        const displayName = (sdata.displayName && String(sdata.displayName).trim()) || identityStr;
+        return res.json({
+            msg: 'تم دخول البوت بنجاح من حساب النمبز الحقيقي (Firebase)',
+            token: sdata.idToken || ('demo-' + Date.now()),
+            user: {
+                id: sdata.localId || ('bot-' + identityStr.replace(/[^a-z0-9_-]/gi, '')),
+                nickname: displayName,
+                email: sdata.email || email,
+            },
+        });
+
+    } catch (err) {
+        return res.status(400).json({ msg: '❌ تعذر التحقق: ' + err.message });
+    }
+});
+
+
+// --- حفظ دائم للغرف والرسائل في ملفات JSON (تبقى بعد إغلاق السيرفر) ---
+const fs = require('fs');
+const path = require('path');
+const DATA_DIR = path.join(__dirname, 'data');
+try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+function loadJson(name, fallback) {
+  try {
+    const f = path.join(DATA_DIR, name);
+    if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf8'));
+  } catch (_) {}
+  return fallback;
+}
+function saveJson(name, data) {
+  try { fs.writeFileSync(path.join(DATA_DIR, name), JSON.stringify(data), 'utf8'); } catch (_) {}
+}
+
+// --- Socket.io للغرف الحية ---
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+app.set('io', io);
+
+// تحميل الغرف والرسائل والأعضاء المحفوظة عند الإقلاع
+try {
+  const chat = require('./routes/chat');
+  const savedHist = loadJson('chat_history.json', {});
+  for (const [k, v] of Object.entries(savedHist)) {
+    if (Array.isArray(v)) chat.__roomHist(k).push(...v.slice(-300));
+  }
+  const savedMem = loadJson('members.json', {});
+  for (const [k, v] of Object.entries(savedMem)) {
+    if (Array.isArray(v)) chat.__roomMembers(k).push(...v);
+  }
+  console.log('[DATA] chat history loaded:', Object.keys(savedHist).length, 'rooms');
+} catch (e) { console.log('[DATA] chat load skipped:', e.message); }
+try {
+  const rr = require('./routes/roomRoutes');
+  const savedRooms = loadJson('rooms.json', []);
+  if (Array.isArray(savedRooms)) {
+    for (const r of savedRooms) rr.__addRoom(r);
+    console.log('[DATA] rooms loaded:', savedRooms.length);
+  }
+  // حفظ تلقائي كل 15 ثانية
+  setInterval(() => {
+    try {
+      const chat = require('./routes/chat');
+      saveJson('chat_history.json', chat.__history || {});
+      saveJson('members.json', chat.__members || {});
+      saveJson('rooms.json', rr.__allRooms());
+    } catch (_) {}
+  }, 15000);
+  // حفظ عند الإغلاق
+  const doSave = () => {
+    try {
+      const chat = require('./routes/chat');
+      saveJson('chat_history.json', chat.__history || {});
+      saveJson('members.json', chat.__members || {});
+      saveJson('rooms.json', rr.__allRooms());
+    } catch (_) {}
+  };
+  process.on('SIGINT', () => { doSave(); process.exit(0); });
+  process.on('SIGTERM', () => { doSave(); process.exit(0); });
+} catch (e) { console.log('[DATA] rooms load skipped:', e.message); }
+
+io.on('connection', (socket) => {
+  socket.on('join_room', (roomId, nickname) => {
+    socket.join(String(roomId));
+    socket.to(String(roomId)).emit('user_joined', { roomId: String(roomId), nickname: nickname || 'زائر' });
+    socket.emit('joined', { roomId: String(roomId) });
+  });
+  socket.on('room_message', (data) => {
+    const roomId = String(data.roomId || 'lobby');
+    const chat = require('./routes/chat');
+    const msg = { sender: data.sender || 'anon', nickname: data.nickname || 'زائر', text: data.text || '', at: new Date().toISOString() };
+    const h = chat.__roomHist(roomId);
+    h.push(msg);
+    io.to(roomId).emit('room_message', { roomId, ...msg });
+  });
+});
+
+// Start Server
+server.listen(PORT, () => {
+  console.log('==========================================');
+  console.log('[NIMBUZZ SERVER STATUS: ONLINE]');
+  console.log('[RUNNING ON PORT: ' + PORT + ']');
+  console.log('[SOCKET.IO: ENABLED]');
+  console.log('==========================================');
+});
