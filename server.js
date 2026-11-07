@@ -377,84 +377,24 @@ io.on('connection', (socket) => {
     }
   });
 
-    socket.on('bot_command', async (data) => {
-    const text = String((data && data.text) || '').trim();
-    if (!text) {
-      socket.emit('bot_reply', { text: 'اكتب الأمر الذي تريد تنفيذه.' });
-      return;
-    }
-
-    // 🤖 [تعديل صانع البوتات ذكياً] قراءة أمر الدخول من الخاص وحقنه في الغرفة المطلوبة
-    if (text.startsWith('ادخل غرفة ')) {
-      try {
-        const targetRoom = text.replace('ادخل غرفة ', '').trim();
-        const botName = "مساعد السيرفر التلقائي"; // أو الاسم الذي تفضله لبوت الغرفة
-
-        if (!targetRoom) {
-          socket.emit('bot_reply', { text: '⚠️ يرجى تحديد اسم الغرفة بدقة بعد الأمر.' });
-          return;
-        }
-
-        const chat = require('./routes/chat');
-        const mem = chat.__roomMembers(targetRoom);
-
-        if (mem) {
-          const botExists = mem.some(m => m.nickname === botName);
-          if (!botExists) {
-            const newBot = {
-              socketId: null,
-              nickname: botName,
-              isBot: true,
-              joinedAt: new Date().toISOString()
-            };
-            mem.push(newBot);
-
-            // 1. بث حدث التحديث للغرفة المستهدفة لتحديث القائمة أونلاين
-            io.to(targetRoom).emit('user_joined_room', {
-              roomId: targetRoom,
-              user: newBot,
-              members: mem
-            });
-
-            // 2. إرسال رسالة نصية داخل الغرفة لتأكيد حضور البوت أمام الجميع
-            const botMessage = {
-              roomId: targetRoom,
-              sender: 'bot',
-              nickname: botName,
-              text: `🤖 [✔] تم حضور البوت بنجاح إلى الغرفة [${targetRoom}] لخدمتكم والتفاعل معكم!`,
-              isBot: true,
-              at: new Date().toISOString()
-            };
-            io.to(targetRoom).emit('room_message', botMessage);
-            io.to(targetRoom).emit('message', botMessage);
-          }
-
-          // 3. الرد عليك في الخاص لتأكيد النجاح الفوري
-          socket.emit('bot_reply', { text: `ابشر تم ارسال البوت بنجاح وتفعيله داخل غرفة [${targetRoom}] 🤖` });
-          console.log(`[BOT SPAWNED VIA PRIVATE] "${botName}" entered room: ${targetRoom}`);
-        } else {
-          socket.emit('bot_reply', { text: `⚠️ عذراً، لم أجد غرفة باسم [${targetRoom}] نشطة حالياً في السيرفر.` });
-        }
-        return; // إنهاء المعالجة هنا بنجاح
-      } catch (error) {
-        console.error('[BOT SPAWN VIA PRIVATE ERROR]:', error);
-        socket.emit('bot_reply', { text: 'تعذر إدخال البوت للغرفة حالياً بسبب خطأ داخلي.' });
-        return;
-      }
-    }
-
-    // إذا كان الأمر ليس "ادخل غرفة"، يمرر للـ botManager القديم للتعامل معه (كودك الأصلي)
-    try {
-      await require('./data/botManager').checkBotCommands(
-        io,
-        { roomId: socket.id, nickname: 'مستخدم Nimbuzz', text },
-        socket.id,
-      );
-    } catch (error) {
-      console.error('[BOT COMMAND ERROR]:', error);
-      socket.emit('bot_reply', { text: 'تعذر تنفيذ الأمر حالياً. يرجى المحاولة مرة أخرى.' });
-    }
-  });
+  // 🤖 توديع تلقائي من البوت للمستخدم المغادر
+try {
+  const botName = "مساعد السيرفر التلقائي";
+  const chat = require('./routes/chat');
+  const mem = chat.__roomMembers(roomId);
+  if (mem && mem.some(m => m.nickname === botName) && nickname !== botName) {
+    const farewellMsg = {
+      roomId: roomId,
+      sender: 'bot',
+      nickname: botName,
+      text: `👋 مع السلامة يا ${nickname}، نشوفك على خير وتوصل بالسلامة.`,
+      isBot: true,
+      at: new Date().toISOString()
+    };
+    io.to(roomId).emit('room_message', farewellMsg);
+    io.to(roomId).emit('message', farewellMsg);
+  }
+} catch(_) {}
 
 
   // Messages (support both 'room_message' and 'message')
