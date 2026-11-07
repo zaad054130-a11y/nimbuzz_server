@@ -328,7 +328,8 @@ io.on('connection', (socket) => {
     
     // 🤖 [تحديث مسار البوت والربط المباشر] القراءة من المجلد الرئيسي الخارجي مباشرة
     try {
-      await require('./botManager').checkBotCommands(io, msg);
+      await require('./data/botManager').checkBotCommands(io, msg);
+
     } catch (error) {
       console.error('[BOT COMMAND ERROR]:', error);
     }
