@@ -329,7 +329,6 @@ io.on('connection', (socket) => {
     // 🤖 [تحديث مسار البوت والربط المباشر] القراءة من المجلد الرئيسي الخارجي مباشرة
     try {
       await require('./data/botManager').checkBotCommands(io, msg);
-
     } catch (error) {
       console.error('[BOT COMMAND ERROR]:', error);
     }
@@ -378,24 +377,129 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 🤖 توديع تلقائي من البوت للمستخدم المغادر
-try {
-  const botName = "مساعد السيرفر التلقائي";
-  const chat = require('./routes/chat');
-  const mem = chat.__roomMembers(roomId);
-  if (mem && mem.some(m => m.nickname === botName) && nickname !== botName) {
-    const farewellMsg = {
-      roomId: roomId,
-      sender: 'bot',
-      nickname: botName,
-      text: `👋 مع السلامة يا ${nickname}، نشوفك على خير وتوصل بالسلامة.`,
-      isBot: true,
-      at: new Date().toISOString()
-    };
-    io.to(roomId).emit('room_message', farewellMsg);
-    io.to(roomId).emit('message', farewellMsg);
-  }
-} catch(_) {}
+    socket.on('bot_command', async (data) => {
+    const text = String((data && data.text) || '').trim();
+    if (!text) {
+      socket.emit('bot_reply', { text: 'اكتب الأمر الذي تريد تنفيذه.' });
+      return;
+    }
+
+    // 🤖 1. أمر استدعاء البوت ودخوله للغرفة من الخاص
+    if (text.startsWith('ادخل غرفة ')) {
+      try {
+        const targetRoom = text.replace('ادخل غرفة ', '').trim();
+        const botName = "مساعد السيرفر التلقائي";
+
+        if (!targetRoom) {
+          socket.emit('bot_reply', { text: '⚠️ يرجى تحديد اسم الغرفة بدقة بعد الأمر.' });
+          return;
+        }
+
+        // استخدام مسار الحروف الصغيرة المتوافق مع مشروعك تماماً
+        const chat = require('./routes/chat');
+        const mem = chat.__roomMembers(targetRoom) || [];
+
+        const botExists = mem.some(m => m.nickname === botName);
+        if (!botExists) {
+          const newBot = {
+            socketId: null,
+            nickname: botName,
+            isBot: true,
+            joinedAt: new Date().toISOString()
+          };
+          mem.push(newBot);
+
+          // بث التحديث للغرفة المستهدفة
+          io.to(targetRoom).emit('user_joined_room', {
+            roomId: targetRoom,
+            user: newBot,
+            members: mem
+          });
+
+          // إرسال رسالة نصية داخل الغرفة لتأكيد الحضور
+          const botMessage = {
+            roomId: targetRoom,
+            sender: 'bot',
+            nickname: botName,
+            text: `🤖 [✔] تم حضور البوت بنجاح إلى الغرفة [${targetRoom}] لخدمتكم والتفاعل معكم!`,
+            isBot: true,
+            at: new Date().toISOString()
+          };
+          io.to(targetRoom).emit('room_message', botMessage);
+          io.to(targetRoom).emit('message', botMessage);
+        }
+
+        socket.emit('bot_reply', { text: `ابشر تم ارسال البوت بنجاح وتفعيله داخل غرفة [${targetRoom}] 🤖` });
+        console.log(`[BOT SPAWNED VIA PRIVATE] "${botName}" entered room: ${targetRoom}`);
+        return;
+      } catch (error) {
+        console.error('[BOT SPAWN ERROR]:', error);
+        socket.emit('bot_reply', { text: 'تعذر إدخال البوت للغرفة حالياً بسبب خطأ داخلي.' });
+        return;
+      }
+    }
+
+    // 🤖 2. أمر طرد البوت وخروجه من الغرفة عبر الخاص
+    if (text.startsWith('اخرج من غرفة ')) {
+      try {
+        const targetRoom = text.replace('اخرج من غرفة ', '').trim();
+        const botName = "مساعد السيرفر التلقائي";
+
+        if (!targetRoom) {
+          socket.emit('bot_reply', { text: '⚠️ يرجى تحديد اسم الغرفة بدقة بعد الأمر.' });
+          return;
+        }
+
+        const chat = require('./routes/chat');
+        const mem = chat.__roomMembers(targetRoom) || [];
+
+        const botIndex = mem.findIndex(m => m.nickname === botName);
+        if (botIndex !== -1) {
+          mem.splice(botIndex, 1);
+
+          // بث رسالة توديع داخل الشات
+          const leaveMessage = {
+            roomId: targetRoom,
+            sender: 'bot',
+            nickname: botName,
+            text: `👋 في أمان الله! تم سحب المساعد برمجياً بطلب من المطور. نشوفكم على خير!`,
+            isBot: true,
+            at: new Date().toISOString()
+          };
+          io.to(targetRoom).emit('room_message', leaveMessage);
+          io.to(targetRoom).emit('message', leaveMessage);
+
+          // بث حدث المغادرة لتحديث القائمة
+          io.to(targetRoom).emit('user_left_room', {
+            roomId: targetRoom,
+            nickname: botName,
+            members: mem
+          });
+
+          socket.emit('bot_reply', { text: `✔ تم سحب البوت وإخراجه بنجاح من غرفة [${targetRoom}].` });
+        } else {
+          socket.emit('bot_reply', { text: `⚠️ البوت غير متواجد أصلاً داخل غرفة [${targetRoom}].` });
+        }
+        return;
+      } catch (error) {
+        console.error('[BOT LEAVE ERROR]:', error);
+        socket.emit('bot_reply', { text: 'تعذر إخراج البوت حالياً بسبب خطأ داخلي.' });
+        return;
+      }
+    }
+
+    // كود التمرير التلقائي الأصلي المستقر (تم تعديل مساره إلى data ليتوافق مع السحاب)
+    try {
+      await require('./data/botManager').checkBotCommands(
+        io,
+        { roomId: socket.id, nickname: 'مستخدم Nimbuzz', text },
+        socket.id,
+      );
+    } catch (error) {
+      console.error('[BOT COMMAND ERROR]:', error);
+      socket.emit('bot_reply', { text: 'تعذر تنفيذ الأمر حالياً.' });
+    }
+  });
 
 
   // Messages (support both 'room_message' and 'message')
