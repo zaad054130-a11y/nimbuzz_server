@@ -1,4 +1,5 @@
-﻿const express = require('express');
+﻿require('dotenv').config();
+const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -8,15 +9,19 @@ const PORT = process.env.PORT || 5001;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // محاولة اتصال MongoDB (اختياري — السيرفر يعمل بدونه)
 try {
   const mongoose = require('mongoose');
-    const dbURI = "mongodb+srv://zaad054130_db_user:jGhqy0Uu23nRkN7W@cluster0.aqt7qfq.mongodb.net/nimbuzz_db?retryWrites=true&w=majority";
-  mongoose.connect(dbURI)
-    .then(() => console.log("[DATABASE] CONNECTED SUCCESSFULLY!"))
-    .catch((err) => console.log("[DATABASE] OFFLINE MODE (no mongo) — chat/login-demo still works:", err.message));
+  const dbURI = process.env.MONGODB_URI;
+  if (dbURI) {
+    mongoose.connect(dbURI)
+      .then(() => console.log("[DATABASE] CONNECTED SUCCESSFULLY!"))
+      .catch((err) => console.log("[DATABASE] OFFLINE MODE — persistent data is unavailable:", err.message));
+  } else {
+    console.warn("[DATABASE] MONGODB_URI is not configured; persistent data is unavailable.");
+  }
 } catch (e) {
   console.log("[DATABASE] mongoose not available, running in memory mode");
 }
@@ -161,6 +166,10 @@ function saveJson(name, data) {
 // --- Socket.io للغرف الحية ---
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+app.use(
+  '/api/profiles',
+  require('./routes/profileRoutes')({ firebaseApiKey: FIREBASE_WEB_API_KEY, io }),
+);
 app.set('io', io);
 
 // سجل المحادثات والغرف دائم، أما الحضور فيبدأ فارغاً بعد كل تشغيل.
