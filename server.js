@@ -617,15 +617,15 @@ io.on('connection', (socket) => {
     } catch (_) {}
   });
 
-  // منح أو سحب الرتب (أونر / مشرف / عضو)
+    // منح أو سحب الرتب (أونر / مشرف / عضو / زائر)
   socket.on('set_room_role', async (data) => {
-    const { roomId, byUser, targetUser, role } = data || {};
+    const { roomId, byUser, targetUser, role } = data || {}; // role: 'owner', 'admin', 'member', 'guest'
     if (!roomId || !byUser || !targetUser) return;
     try {
       const roleDoc = await RoomRole.findOne({ roomId });
       if (!roleDoc) return;
 
-      // حماية مطلقة للمالك الأصلي من السحب أو التعديل
+      // حماية مطلقة للمالك الأصلي
       if (targetUser === roleDoc.owner) {
         socket.emit('admin_error', { msg: '🛡️ لا يمكن تعديل أو سحب رتبة مالك الغرفة الأصلي!' });
         return;
@@ -633,27 +633,41 @@ io.on('connection', (socket) => {
 
       const isCreator = roleDoc.owner === byUser;
       const isCoOwner = roleDoc.coOwners.includes(byUser);
+      const isAdmin = roleDoc.admins.includes(byUser);
 
-      // منح أو سحب الأونر للمالك الأصلي فقط
+      // التحقق من الصلاحيات الهرمية:
       if (role === 'owner' && !isCreator) {
-        socket.emit('admin_error', { msg: 'فقط مالك الغرفة الأصلي يمكنه منح رتبة أونر!' });
+        socket.emit('admin_error', { msg: 'فقط مالك الغرفة الأصلي يمكنه منح أو سحب رتبة أونر!' });
         return;
       }
-      if (!isCreator && !isCoOwner) {
+      if (role === 'admin' && !isCreator && !isCoOwner) {
+        socket.emit('admin_error', { msg: 'فقط المالك أو الأونر يمكنه منح رتبة مشرف!' });
+        return;
+      }
+      if (!isCreator && !isCoOwner && !isAdmin) {
         socket.emit('admin_error', { msg: 'ليس لديك صلاحية تعديل الرتب!' });
         return;
+      }
+      // المشرف لا يستطيع تغيير رتبة مشرف آخر أو أونر
+      if (isAdmin && !isCreator && !isCoOwner) {
+        if (roleDoc.coOwners.includes(targetUser) || roleDoc.admins.includes(targetUser)) {
+          socket.emit('admin_error', { msg: 'لا يمكنك سحب صلاحية مشرف أو أونر!' });
+          return;
+        }
       }
 
       roleDoc.coOwners = roleDoc.coOwners.filter(u => u !== targetUser);
       roleDoc.admins = roleDoc.admins.filter(u => u !== targetUser);
 
-      let label = 'عضو عادي';
+      let label = 'عضو 👤';
       if (role === 'owner') {
         roleDoc.coOwners.push(targetUser);
         label = 'أونر (Owner) 👑';
       } else if (role === 'admin') {
         roleDoc.admins.push(targetUser);
         label = 'مشرف (Admin) 🛡️';
+      } else if (role === 'guest') {
+        label = 'زائر 🚶';
       }
 
       await roleDoc.save();
@@ -664,10 +678,12 @@ io.on('connection', (socket) => {
         admins: roleDoc.admins,
         banned: roleDoc.banned,
       });
+
+      // إرسال الإشعار باسم الشخص المنفذ مباشرة بدون كلمة "النظام"
       io.to(roomId).emit('room_message', {
         roomId,
-        sender: 'system',
-        nickname: 'النظام',
+        sender: byUser,
+        nickname: byUser,
         text: `🎖️ قام ${byUser} بتعيين رتبة ${targetUser} إلى: ${label}`,
         at: new Date().toISOString(),
       });
@@ -676,7 +692,7 @@ io.on('connection', (socket) => {
 
   // 🚫 الطرد أو الحظر أو فك الحظر الحقيقي
   socket.on('moderate_user', async (data) => {
-    const { roomId, byUser, targetUser, action } = data || {};
+    const { roomId, byUser, targetUser, action } = data || {}; // action: 'kick', 'ban', 'unban'
     if (!roomId || !byUser || !targetUser) return;
     try {
       const roleDoc = await RoomRole.findOne({ roomId });
@@ -695,13 +711,13 @@ io.on('connection', (socket) => {
         socket.emit('admin_error', { msg: 'ليس لديك صلاحية إدارية!' });
         return;
       }
-      if ((action === 'ban' || action === 'unban') && !isCreator && !isCoOwner) {
-        socket.emit('admin_error', { msg: 'صلاحية الحظر وفك الحظر للمالك والأونر فقط!' });
-        return;
-      }
-      if (isAdmin && !isCreator && !isCoOwner && roleDoc.coOwners.includes(targetUser)) {
-        socket.emit('admin_error', { msg: 'لا يمكنك طرد عضو أعلى منك رتبة!' });
-        return;
+
+      // المشرف لا يمكنه طرد أو حظر مشرف آخر أو أونر
+      if (isAdmin && !isCreator && !isCoOwner) {
+        if (roleDoc.coOwners.includes(targetUser) || roleDoc.admins.includes(targetUser)) {
+          socket.emit('admin_error', { msg: 'لا يمكنك طرد أو حظر مشرف أو أونر!' });
+          return;
+        }
       }
 
       if (action === 'unban') {
@@ -716,8 +732,8 @@ io.on('connection', (socket) => {
         });
         io.to(roomId).emit('room_message', {
           roomId,
-          sender: 'system',
-          nickname: 'النظام',
+          sender: byUser,
+          nickname: byUser,
           text: `✅ قام ${byUser} بفك الحظر عن ${targetUser}`,
           at: new Date().toISOString(),
         });
@@ -749,7 +765,7 @@ io.on('connection', (socket) => {
               roomId,
               byUser,
               msg: action === 'ban'
-                ? `🚫 تم حظرك نهائياً من غرفة ${roomId} بواسطة ${byUser}`
+                ? `🚫 تم حظرك من غرفة ${roomId} بواسطة ${byUser}`
                 : `👢 تم طردك من غرفة ${roomId} بواسطة ${byUser}`,
             });
           }
@@ -762,18 +778,20 @@ io.on('connection', (socket) => {
         if (mem[i].nickname === targetUser) mem.splice(i, 1);
       }
 
+      // إرسال الإشعار باسم المنفذ مباشرة بدون كلمة "النظام"
       io.to(roomId).emit('room_message', {
         roomId,
-        sender: 'system',
-        nickname: 'النظام',
+        sender: byUser,
+        nickname: byUser,
         text: action === 'ban'
-          ? `🚫 تم حظر ${targetUser} من الغرفة بواسطة ${byUser}`
-          : `👢 تم طرد ${targetUser} من الغرفة بواسطة ${byUser}`,
+          ? `🚫 قام ${byUser} بحظر ${targetUser} من الغرفة`
+          : `👢 قام ${byUser} بطرد ${targetUser} من الغرفة`,
         at: new Date().toISOString(),
       });
       SystemEvents.leave(roomId, targetUser);
     } catch (_) {}
   });
+
 
   // 💬 إرسال رسالة خاصة حقيقية وحفظها في MongoDB
   socket.on('private_message', async (data) => {
