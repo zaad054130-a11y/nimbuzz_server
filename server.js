@@ -29,9 +29,12 @@ try {
 const mongoose = require('mongoose');
 const RoomRoleSchema = new mongoose.Schema({
   roomId: { type: String, unique: true, required: true },
-  owner: { type: String, required: true },
-  admins: { type: [String], default: [] },
+  owner: { type: String, required: true }, // المالك الأصلي المحمي
+  coOwners: { type: [String], default: [] }, // أونر ممنوح
+  admins: { type: [String], default: [] }, // مشرفين
+  banned: { type: [String], default: [] }, // المحظورين من الدخول
 });
+
 const PrivateMsgSchema = new mongoose.Schema({
   from: { type: String, required: true },
   to: { type: String, required: true },
@@ -587,8 +590,7 @@ io.on('connection', (socket) => {
       }
     } catch (_) {}
   });
-
-  // جلب رتب الغرفة وتعيين أول منشئ كـ Owner وحيد
+  // جلب رتب الغرفة والمحظورين
   socket.on('get_room_roles', async (data) => {
     const roomId = String((data && data.roomId) || '').trim();
     const requester = String((data && data.nickname) || '').trim();
@@ -596,63 +598,144 @@ io.on('connection', (socket) => {
     try {
       let roleDoc = await RoomRole.findOne({ roomId });
       if (!roleDoc && requester) {
-        roleDoc = await RoomRole.create({ roomId, owner: requester, admins: [] });
+        roleDoc = await RoomRole.create({ roomId, owner: requester, coOwners: [], admins: [], banned: [] });
+      }
+      if (roleDoc && roleDoc.banned.includes(requester) && roleDoc.owner !== requester) {
+        socket.emit('kicked_from_room', {
+          roomId,
+          msg: `🚫 أنت محظور من دخول غرفة ${roomId}!`,
+        });
+        return;
       }
       io.to(roomId).emit('room_roles_updated', {
         roomId,
         owner: roleDoc ? roleDoc.owner : '',
+        coOwners: roleDoc ? roleDoc.coOwners : [],
         admins: roleDoc ? roleDoc.admins : [],
+        banned: roleDoc ? roleDoc.banned : [],
       });
     } catch (_) {}
   });
 
-  // منح أو سحب رتبة أونر/أدمن (للمالك الأصلي فقط)
+  // منح أو سحب الرتب (أونر / مشرف / عضو)
   socket.on('set_room_role', async (data) => {
-    const { roomId, byUser, targetUser, action } = data || {};
+    const { roomId, byUser, targetUser, role } = data || {};
     if (!roomId || !byUser || !targetUser) return;
     try {
       const roleDoc = await RoomRole.findOne({ roomId });
-      if (!roleDoc || roleDoc.owner !== byUser) {
-        socket.emit('admin_error', { msg: 'فقط مالك الغرفة (Owner) يمكنه منح أو سحب الرتب!' });
+      if (!roleDoc) return;
+
+      // حماية مطلقة للمالك الأصلي من السحب أو التعديل
+      if (targetUser === roleDoc.owner) {
+        socket.emit('admin_error', { msg: '🛡️ لا يمكن تعديل أو سحب رتبة مالك الغرفة الأصلي!' });
         return;
       }
-      if (action === 'grant' && !roleDoc.admins.includes(targetUser)) {
-        roleDoc.admins.push(targetUser);
-      } else if (action === 'revoke') {
-        roleDoc.admins = roleDoc.admins.filter(u => u !== targetUser);
+
+      const isCreator = roleDoc.owner === byUser;
+      const isCoOwner = roleDoc.coOwners.includes(byUser);
+
+      // منح أو سحب الأونر للمالك الأصلي فقط
+      if (role === 'owner' && !isCreator) {
+        socket.emit('admin_error', { msg: 'فقط مالك الغرفة الأصلي يمكنه منح رتبة أونر!' });
+        return;
       }
+      if (!isCreator && !isCoOwner) {
+        socket.emit('admin_error', { msg: 'ليس لديك صلاحية تعديل الرتب!' });
+        return;
+      }
+
+      roleDoc.coOwners = roleDoc.coOwners.filter(u => u !== targetUser);
+      roleDoc.admins = roleDoc.admins.filter(u => u !== targetUser);
+
+      let label = 'عضو عادي';
+      if (role === 'owner') {
+        roleDoc.coOwners.push(targetUser);
+        label = 'أونر (Owner) 👑';
+      } else if (role === 'admin') {
+        roleDoc.admins.push(targetUser);
+        label = 'مشرف (Admin) 🛡️';
+      }
+
       await roleDoc.save();
       io.to(roomId).emit('room_roles_updated', {
         roomId,
         owner: roleDoc.owner,
+        coOwners: roleDoc.coOwners,
         admins: roleDoc.admins,
+        banned: roleDoc.banned,
       });
       io.to(roomId).emit('room_message', {
         roomId,
         sender: 'system',
         nickname: 'النظام',
-        text: action === 'grant'
-          ? `👑 قام المالك ${byUser} بمنح رتبة أونر لـ ${targetUser}`
-          : `🔻 قام المالك ${byUser} بسحب رتبة الأونر من ${targetUser}`,
+        text: `🎖️ قام ${byUser} بتعيين رتبة ${targetUser} إلى: ${label}`,
         at: new Date().toISOString(),
       });
     } catch (_) {}
   });
 
-  // 🚫 الطرد الحقيقي الفوري من الغرفة
-  socket.on('kick_user', async (data) => {
-    const { roomId, byUser, targetUser } = data || {};
+  // 🚫 الطرد أو الحظر أو فك الحظر الحقيقي
+  socket.on('moderate_user', async (data) => {
+    const { roomId, byUser, targetUser, action } = data || {};
     if (!roomId || !byUser || !targetUser) return;
     try {
       const roleDoc = await RoomRole.findOne({ roomId });
-      const isAuthorized = roleDoc && (roleDoc.owner === byUser || roleDoc.admins.includes(byUser));
-      if (!isAuthorized) {
-        socket.emit('admin_error', { msg: 'ليس لديك صلاحية طرد الأعضاء!' });
+      if (!roleDoc) return;
+
+      if (targetUser === roleDoc.owner) {
+        socket.emit('admin_error', { msg: '🛡️ لا يمكن طرد أو حظر مالك الغرفة الأصلي!' });
         return;
       }
-      if (roleDoc.owner === targetUser) {
-        socket.emit('admin_error', { msg: 'لا يمكن طرد مالك الغرفة!' });
+
+      const isCreator = roleDoc.owner === byUser;
+      const isCoOwner = roleDoc.coOwners.includes(byUser);
+      const isAdmin = roleDoc.admins.includes(byUser);
+
+      if (!isCreator && !isCoOwner && !isAdmin) {
+        socket.emit('admin_error', { msg: 'ليس لديك صلاحية إدارية!' });
         return;
+      }
+      if ((action === 'ban' || action === 'unban') && !isCreator && !isCoOwner) {
+        socket.emit('admin_error', { msg: 'صلاحية الحظر وفك الحظر للمالك والأونر فقط!' });
+        return;
+      }
+      if (isAdmin && !isCreator && !isCoOwner && roleDoc.coOwners.includes(targetUser)) {
+        socket.emit('admin_error', { msg: 'لا يمكنك طرد عضو أعلى منك رتبة!' });
+        return;
+      }
+
+      if (action === 'unban') {
+        roleDoc.banned = roleDoc.banned.filter(u => u !== targetUser);
+        await roleDoc.save();
+        io.to(roomId).emit('room_roles_updated', {
+          roomId,
+          owner: roleDoc.owner,
+          coOwners: roleDoc.coOwners,
+          admins: roleDoc.admins,
+          banned: roleDoc.banned,
+        });
+        io.to(roomId).emit('room_message', {
+          roomId,
+          sender: 'system',
+          nickname: 'النظام',
+          text: `✅ قام ${byUser} بفك الحظر عن ${targetUser}`,
+          at: new Date().toISOString(),
+        });
+        return;
+      }
+
+      if (action === 'ban') {
+        if (!roleDoc.banned.includes(targetUser)) roleDoc.banned.push(targetUser);
+        roleDoc.coOwners = roleDoc.coOwners.filter(u => u !== targetUser);
+        roleDoc.admins = roleDoc.admins.filter(u => u !== targetUser);
+        await roleDoc.save();
+        io.to(roomId).emit('room_roles_updated', {
+          roomId,
+          owner: roleDoc.owner,
+          coOwners: roleDoc.coOwners,
+          admins: roleDoc.admins,
+          banned: roleDoc.banned,
+        });
       }
 
       const roomSockets = io.sockets.adapter.rooms.get(roomId);
@@ -665,7 +748,9 @@ io.on('connection', (socket) => {
             targetSock.emit('kicked_from_room', {
               roomId,
               byUser,
-              msg: `تم طردك من غرفة ${roomId} بواسطة ${byUser}`,
+              msg: action === 'ban'
+                ? `🚫 تم حظرك نهائياً من غرفة ${roomId} بواسطة ${byUser}`
+                : `👢 تم طردك من غرفة ${roomId} بواسطة ${byUser}`,
             });
           }
         }
@@ -681,7 +766,9 @@ io.on('connection', (socket) => {
         roomId,
         sender: 'system',
         nickname: 'النظام',
-        text: `🚫 تم طرد ${targetUser} من الغرفة بواسطة ${byUser}`,
+        text: action === 'ban'
+          ? `🚫 تم حظر ${targetUser} من الغرفة بواسطة ${byUser}`
+          : `👢 تم طرد ${targetUser} من الغرفة بواسطة ${byUser}`,
         at: new Date().toISOString(),
       });
       SystemEvents.leave(roomId, targetUser);
