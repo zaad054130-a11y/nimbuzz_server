@@ -25,6 +25,29 @@ try {
 } catch (e) {
   console.log("[DATABASE] mongoose not available, running in memory mode");
 }
+// --- نماذج قاعدة البيانات الدائمة (الرتب، المحادثات الخاصة، طلبات الصداقة) ---
+const mongoose = require('mongoose');
+const RoomRoleSchema = new mongoose.Schema({
+  roomId: { type: String, unique: true, required: true },
+  owner: { type: String, required: true },
+  admins: { type: [String], default: [] },
+});
+const PrivateMsgSchema = new mongoose.Schema({
+  from: { type: String, required: true },
+  to: { type: String, required: true },
+  text: { type: String, required: true },
+  at: { type: Date, default: Date.now },
+});
+const FriendReqSchema = new mongoose.Schema({
+  from: { type: String, required: true },
+  to: { type: String, required: true },
+  status: { type: String, default: 'pending' },
+  at: { type: Date, default: Date.now },
+});
+
+const RoomRole = mongoose.models.RoomRole || mongoose.model('RoomRole', RoomRoleSchema);
+const PrivateMsg = mongoose.models.PrivateMsg || mongoose.model('PrivateMsg', PrivateMsgSchema);
+const FriendReq = mongoose.models.FriendReq || mongoose.model('FriendReq', FriendReqSchema);
 
 // Base Route
 app.get('/', (req, res) => {
@@ -171,6 +194,39 @@ app.use(
   require('./routes/profileRoutes')({ firebaseApiKey: FIREBASE_WEB_API_KEY, io }),
 );
 app.set('io', io);
+// جلب سجل المحادثات الخاصة بين شخصين
+app.get('/api/private-messages', async (req, res) => {
+  try {
+    const { u1, u2 } = req.query;
+    if (!u1 || !u2 || mongoose.connection.readyState !== 1) return res.json([]);
+    const msgs = await PrivateMsg.find({
+      $or: [
+        { from: u1, to: u2 },
+        { from: u2, to: u1 },
+      ],
+    }).sort({ at: 1 }).limit(200).lean();
+    return res.json(msgs);
+  } catch (e) {
+    return res.json([]);
+  }
+});
+
+// جلب قائمة الأصدقاء وطلبات الصداقة المعلقة للمستخدم
+app.get('/api/friends/:nickname', async (req, res) => {
+  try {
+    const user = String(req.params.nickname || '').trim();
+    if (!user || mongoose.connection.readyState !== 1) return res.json({ friends: [], pending: [] });
+    const accepted = await FriendReq.find({
+      status: 'accepted',
+      $or: [{ from: user }, { to: user }],
+    }).lean();
+    const friends = accepted.map(r => (r.from === user ? r.to : r.from));
+    const pending = await FriendReq.find({ to: user, status: 'pending' }).lean();
+    return res.json({ friends, pending });
+  } catch (e) {
+    return res.json({ friends, pending });
+  }
+});
 
 // سجل المحادثات والغرف دائم، أما الحضور فيبدأ فارغاً بعد كل تشغيل.
 try {
@@ -510,6 +566,192 @@ io.on('connection', (socket) => {
     }
   });
 
+  // تسجيل هوية المستخدم على السوكيت ليصله الخاص وطلبات الصداقة أينما كان
+  socket.on('register_user', async (data) => {
+    const nickname = String((data && data.nickname) || data || '').trim();
+    if (!nickname) return;
+    socket.data = socket.data || {};
+    socket.data.nickname = nickname;
+    socket.join('user:' + nickname);
+
+    try {
+      if (mongoose.connection.readyState === 1) {
+        const pending = await FriendReq.find({ to: nickname, status: 'pending' }).lean();
+        for (const reqItem of pending) {
+          socket.emit('friend_request_received', {
+            id: reqItem._id,
+            from: reqItem.from,
+            message: `لديك طلب صداقة جديد من ${reqItem.from}`,
+          });
+        }
+      }
+    } catch (_) {}
+  });
+
+  // جلب رتب الغرفة وتعيين أول منشئ كـ Owner وحيد
+  socket.on('get_room_roles', async (data) => {
+    const roomId = String((data && data.roomId) || '').trim();
+    const requester = String((data && data.nickname) || '').trim();
+    if (!roomId) return;
+    try {
+      let roleDoc = await RoomRole.findOne({ roomId });
+      if (!roleDoc && requester) {
+        roleDoc = await RoomRole.create({ roomId, owner: requester, admins: [] });
+      }
+      io.to(roomId).emit('room_roles_updated', {
+        roomId,
+        owner: roleDoc ? roleDoc.owner : '',
+        admins: roleDoc ? roleDoc.admins : [],
+      });
+    } catch (_) {}
+  });
+
+  // منح أو سحب رتبة أونر/أدمن (للمالك الأصلي فقط)
+  socket.on('set_room_role', async (data) => {
+    const { roomId, byUser, targetUser, action } = data || {};
+    if (!roomId || !byUser || !targetUser) return;
+    try {
+      const roleDoc = await RoomRole.findOne({ roomId });
+      if (!roleDoc || roleDoc.owner !== byUser) {
+        socket.emit('admin_error', { msg: 'فقط مالك الغرفة (Owner) يمكنه منح أو سحب الرتب!' });
+        return;
+      }
+      if (action === 'grant' && !roleDoc.admins.includes(targetUser)) {
+        roleDoc.admins.push(targetUser);
+      } else if (action === 'revoke') {
+        roleDoc.admins = roleDoc.admins.filter(u => u !== targetUser);
+      }
+      await roleDoc.save();
+      io.to(roomId).emit('room_roles_updated', {
+        roomId,
+        owner: roleDoc.owner,
+        admins: roleDoc.admins,
+      });
+      io.to(roomId).emit('room_message', {
+        roomId,
+        sender: 'system',
+        nickname: 'النظام',
+        text: action === 'grant'
+          ? `👑 قام المالك ${byUser} بمنح رتبة أونر لـ ${targetUser}`
+          : `🔻 قام المالك ${byUser} بسحب رتبة الأونر من ${targetUser}`,
+        at: new Date().toISOString(),
+      });
+    } catch (_) {}
+  });
+
+  // 🚫 الطرد الحقيقي الفوري من الغرفة
+  socket.on('kick_user', async (data) => {
+    const { roomId, byUser, targetUser } = data || {};
+    if (!roomId || !byUser || !targetUser) return;
+    try {
+      const roleDoc = await RoomRole.findOne({ roomId });
+      const isAuthorized = roleDoc && (roleDoc.owner === byUser || roleDoc.admins.includes(byUser));
+      if (!isAuthorized) {
+        socket.emit('admin_error', { msg: 'ليس لديك صلاحية طرد الأعضاء!' });
+        return;
+      }
+      if (roleDoc.owner === targetUser) {
+        socket.emit('admin_error', { msg: 'لا يمكن طرد مالك الغرفة!' });
+        return;
+      }
+
+      const roomSockets = io.sockets.adapter.rooms.get(roomId);
+      if (roomSockets) {
+        for (const sid of roomSockets) {
+          const targetSock = io.sockets.sockets.get(sid);
+          if (targetSock && targetSock.data && targetSock.data.nickname === targetUser) {
+            targetSock.leave(roomId);
+            if (targetSock.data.roomIds) targetSock.data.roomIds.delete(roomId);
+            targetSock.emit('kicked_from_room', {
+              roomId,
+              byUser,
+              msg: `تم طردك من غرفة ${roomId} بواسطة ${byUser}`,
+            });
+          }
+        }
+      }
+
+      const chat = require('./routes/chat');
+      const mem = chat.__roomMembers(roomId);
+      for (let i = mem.length - 1; i >= 0; i--) {
+        if (mem[i].nickname === targetUser) mem.splice(i, 1);
+      }
+
+      io.to(roomId).emit('room_message', {
+        roomId,
+        sender: 'system',
+        nickname: 'النظام',
+        text: `🚫 تم طرد ${targetUser} من الغرفة بواسطة ${byUser}`,
+        at: new Date().toISOString(),
+      });
+      SystemEvents.leave(roomId, targetUser);
+    } catch (_) {}
+  });
+
+  // 💬 إرسال رسالة خاصة حقيقية وحفظها في MongoDB
+  socket.on('private_message', async (data) => {
+    const from = String((data && data.from) || '').trim();
+    const to = String((data && data.to) || '').trim();
+    const text = String((data && data.text) || '').trim();
+    if (!from || !to || !text) return;
+
+    const msgObj = { from, to, text, at: new Date().toISOString() };
+    try {
+      if (mongoose.connection.readyState === 1) {
+        await PrivateMsg.create(msgObj);
+      }
+    } catch (_) {}
+
+    io.to('user:' + to).emit('private_message', msgObj);
+    io.to('user:' + from).emit('private_message', msgObj);
+  });
+
+  // 🤝 إرسال طلب صداقة مع تنبيه فوري للمستلم
+  socket.on('send_friend_request', async (data) => {
+    const from = String((data && data.from) || '').trim();
+    const to = String((data && data.to) || '').trim();
+    if (!from || !to || from === to) return;
+
+    try {
+      if (mongoose.connection.readyState === 1) {
+        const exists = await FriendReq.findOne({
+          $or: [
+            { from, to },
+            { from: to, to: from },
+          ],
+        });
+        if (exists) {
+          socket.emit('friend_info', { msg: 'يوجد طلب صداقة مسبق أو أنتما أصدقاء بالفعل.' });
+          return;
+        }
+        const created = await FriendReq.create({ from, to, status: 'pending' });
+        io.to('user:' + to).emit('friend_request_received', {
+          id: created._id,
+          from,
+          message: `لديك طلب صداقة جديد من ${from}`,
+        });
+        socket.emit('friend_info', { msg: `تم إرسال طلب الصداقة إلى ${to} بنجاح.` });
+      }
+    } catch (_) {}
+  });
+
+  // الرد على طلب الصداقة (قبول أو رفض)
+  socket.on('respond_friend_request', async (data) => {
+    const { from, to, accept } = data || {};
+    if (!from || !to) return;
+    try {
+      if (mongoose.connection.readyState === 1) {
+        await FriendReq.findOneAndUpdate(
+          { from, to, status: 'pending' },
+          { status: accept ? 'accepted' : 'rejected' },
+        );
+        if (accept) {
+          io.to('user:' + from).emit('friend_info', { msg: `وافق ${to} على طلب صداقتك!` });
+          io.to('user:' + to).emit('friend_info', { msg: `أصبحت الآن صديقاً لـ ${from}!` });
+        }
+      }
+    } catch (_) {}
+  });
 
   // Messages (support both 'room_message' and 'message')
   socket.on('room_message', doMessage);
